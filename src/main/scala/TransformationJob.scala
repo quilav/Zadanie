@@ -87,13 +87,16 @@ object TransformationJob {
         .groupBy("country")
         .agg(collect_list(struct("browser", "id_and_date_list")).as("browser_data"))
 
-      // Zapisanie wyniku do pliku JSON
-      resultData.coalesce(1).write.json("/app/wyniki.json")
+      val pivotedDF = resultData
+        .groupBy()
+        .pivot("country")
+        .agg(first("browser_data").alias("browser_data"))
+        .drop("(not set)")
 
-      // Zakończenie sesji Spark
+      pivotedDF.coalesce(1).write.json("/app/wyniki.json")
+
       spark.stop()
     } catch {
-      // Obsługa błędów
       case e: Exception =>
         e.printStackTrace()
     }
