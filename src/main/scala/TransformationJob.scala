@@ -1,104 +1,119 @@
-import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.{DataFrame, Encoders, SparkSession}
+
+import scala.util.{Either, Try}
 
 object TransformationJob {
+
   def main(args: Array[String]): Unit = {
-    try {
-      // Inicjowanie sesji Spark
-      val spark = SparkSession.builder
-        .appName("TransformationJob")
-        .master("local[*]")
-        .getOrCreate()
+    val spark = SparkSession.builder
+      .appName("TransformationJob")
+      .master("local[*]")
+      .getOrCreate()
 
-      // Definicja struktury dla danych w kolumnie "device" (json)
-      val deviceSchema = StructType(Seq(
-        StructField("browser", StringType, nullable = true),
-        StructField("browserVersion", StringType, nullable = true),
-        StructField("browserSize", StringType, nullable = true),
-        StructField("operatingSystem", StringType, nullable = true),
-        StructField("operatingSystemVersion", StringType, nullable = true),
-        StructField("isMobile", BooleanType, nullable = true),
-        StructField("mobileDeviceBranding", StringType, nullable = true),
-        StructField("mobileDeviceModel", StringType, nullable = true),
-        StructField("mobileInputSelector", StringType, nullable = true),
-        StructField("mobileDeviceInfo", StringType, nullable = true),
-        StructField("mobileDeviceMarketingName", StringType, nullable = true),
-        StructField("flashVersion", StringType, nullable = true),
-        StructField("language", StringType, nullable = true),
-        StructField("screenColors", StringType, nullable = true),
-        StructField("screenResolution", StringType, nullable = true),
-        StructField("deviceCategory", StringType, nullable = true)
-      ))
+    val deviceSchema = Encoders.product[Device].schema
+    val geoNetworkSchema = Encoders.product[GeoNetwork].schema
 
-      // Definicja struktury dla danych w kolumnie "geoNetwork" (json)
-      val geoNetworkSchema = StructType(Seq(
-        StructField("continent", StringType, nullable = true),
-        StructField("subContinent", StringType, nullable = true),
-        StructField("country", StringType, nullable = true),
-        StructField("region", StringType, nullable = true),
-        StructField("metro", StringType, nullable = true),
-        StructField("city", StringType, nullable = true),
-        StructField("cityId", StringType, nullable = true),
-        StructField("networkDomain", StringType, nullable = true),
-        StructField("latitude", StringType, nullable = true),
-        StructField("longitude", StringType, nullable = true),
-        StructField("networkLocation", StringType, nullable = true)
-      ))
+    val inputPath = "/app/dane.csv"
+    val outputPath = "/app/wyniki"
 
-      // Wczytanie danych z pliku CSV
-      val csvFilePath = "/app/dane.csv"
-      val rawData = spark.read
-        .option("header", value = true)
-        .option("quote", "\"")
-        .option("escape", "\"")
-        .csv(csvFilePath)
+    val result: Either[String, DataFrame] = for {
+      rawData <- readData(spark, inputPath, header = true, "\"", "\"")
+      processedData <- processJsonColumns(rawData, deviceSchema, geoNetworkSchema)
+      explodedData <- extractNestedColumns(processedData)
+      preprocessedData <- prepareDataBeforeGrouping(explodedData)
+      sortedData <- sortListByDate(preprocessedData)
+      limitedData <- limitListToLastVisitors(sortedData, 5)
+      resultData <- prepareJsonStructure(limitedData)
+      pivotedDF <- pivotAndAggregateData(resultData)
+      _ <- writeResultToJson(pivotedDF, outputPath)
+    } yield pivotedDF
 
-      // Deserializacja kolumn JSON (device i geoNetwork) do struktur danych
-      val processedData = rawData
+    result match {
+      case Left(error) =>
+        logError(s"Error during the transformation process: $error")
+      case Right(_) =>
+    }
+
+    spark.stop()
+  }
+
+  private def readData(spark: SparkSession, filePath: String, header: Boolean, quote: String, escape: String): Either[String, DataFrame] =
+    Try {
+      spark.read
+        .option("header", header)
+        .option("quote", quote)
+        .option("escape", escape)
+        .csv(filePath)
+    }.toEither.left.map(e => s"Error occurred during data reading: ${e.getMessage}")
+
+  private def processJsonColumns(rawData: DataFrame, deviceSchema: StructType, geoNetworkSchema: StructType): Either[String, DataFrame] =
+    Try {
+      rawData
         .withColumn("device", from_json(col("device"), deviceSchema))
         .withColumn("geoNetwork", from_json(col("geoNetwork"), geoNetworkSchema))
+    }.toEither.left.map(e => s"Error during JSON column processing: ${e.getMessage}")
 
-      // Ekstrakcja kolumn zagnieżdżonych
-      val explodedData = processedData.select(
+  private def extractNestedColumns(processedData: DataFrame): Either[String, DataFrame] =
+    Try {
+      processedData.select(
         col("_c0"),
         col("date"),
         col("fullVisitorId"),
-        col("device.*"),    // Wybór wszystkich kolumn ze struktury 'device'
-        col("geoNetwork.*") // Wybór wszystkich kolumn ze struktury 'geoNetwork'
-      )
+        col("device.*"),
+        col("geoNetwork.*"))
+    }.toEither.left.map(e => s"Error during nested columns extraction: ${e.getMessage}")
 
-      // Przygotowanie danych przed grupowaniem
-      val preprocessedData = explodedData
+  private def prepareDataBeforeGrouping(explodedData: DataFrame): Either[String, DataFrame] =
+    Try {
+      explodedData
         .withColumn("id_and_date", struct(col("fullVisitorId"), col("date")))
         .groupBy("country", "browser")
         .agg(collect_list("id_and_date").as("id_and_date_list"))
+    }.toEither.left.map(e => s"Error during data preparation before grouping: ${e.getMessage}")
 
-      // Sortowanie listy według daty
-      val sortedData = preprocessedData
-        .withColumn("id_and_date_list", expr("sort_array(id_and_date_list, true)"))
+  private def sortListByDate(preprocessedData: DataFrame): Either[String, DataFrame] =
+    Try {
+      preprocessedData.withColumn("id_and_date_list", expr("sort_array(id_and_date_list, true)"))
+    }.toEither.left.map(e => s"Error during list sorting by date: ${e.getMessage}")
 
-      // Ograniczenie listy do maksymalnie 5 ostatnich odwiedzających
-      val limitedData = sortedData
-        .withColumn("id_and_date_list", expr("slice(id_and_date_list, 1, 5)"))
+  private def limitListToLastVisitors(sortedData: DataFrame, limit: Int): Either[String, DataFrame] =
+    Try {
+      sortedData.withColumn("id_and_date_list", expr(s"slice(id_and_date_list, 1, $limit)"))
+    }.toEither.left.map(e => s"Error during limiting list to last visitors: ${e.getMessage}")
 
-      // Przygotowanie struktury JSON
-      val resultData = limitedData
+  private def prepareJsonStructure(limitedData: DataFrame): Either[String, DataFrame] =
+    Try {
+      limitedData
         .groupBy("country")
         .agg(collect_list(struct("browser", "id_and_date_list")).as("browser_data"))
+    }.toEither.left.map(e => s"Error during JSON structure preparation: ${e.getMessage}")
 
-      val pivotedDF = resultData
+  private def pivotAndAggregateData(resultData: DataFrame): Either[String, DataFrame] =
+    Try {
+      resultData
         .groupBy()
         .pivot("country")
         .agg(first("browser_data").alias("browser_data"))
         .drop("(not set)")
+    }.toEither.left.map(e => s"Error during data pivoting and aggregation: ${e.getMessage}")
 
-      pivotedDF.coalesce(1).write.json("/app/wyniki.json")
+  private def writeResultToJson(pivotedDF: DataFrame, outputPath: String): Either[String, Unit] =
+    Try {
+      pivotedDF.coalesce(1).write.json(outputPath)
+    }.toEither.left.map(e => s"Error during writing result to JSON: ${e.getMessage}")
 
-      spark.stop()
-    } catch {
-      case e: Exception =>
-        e.printStackTrace()
-    }
-  }
+  private def logError(message: String): Unit =
+    println(s"Error: $message")
+
+  private case class Device(browser: String, browserVersion: String, browserSize: String,
+                            operatingSystem: String, operatingSystemVersion: String, isMobile: Boolean,
+                            mobileDeviceBranding: String, mobileDeviceModel: String, mobileInputSelector: String,
+                            mobileDeviceInfo: String, mobileDeviceMarketingName: String, flashVersion: String,
+                            language: String, screenColors: String, screenResolution: String, deviceCategory: String)
+
+  private case class GeoNetwork(continent: String, subContinent: String, country: String, region: String,
+                                metro: String, city: String, cityId: String, networkDomain: String,
+                                latitude: String, longitude: String, networkLocation: String)
 }
