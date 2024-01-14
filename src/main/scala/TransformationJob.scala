@@ -5,6 +5,7 @@ import org.apache.spark.sql.types._
 object TransformationJob {
   def main(args: Array[String]): Unit = {
     try {
+      // Inicjowanie sesji Spark
       val spark = SparkSession.builder
         .appName("TransformationJob")
         .master("local[*]")
@@ -45,56 +46,56 @@ object TransformationJob {
         StructField("networkLocation", StringType, nullable = true)
       ))
 
-      // Cała struktura dla jednego wiersza z CSV
-      val schema = StructType(Seq(
-        StructField("_c0", LongType, nullable = false),
-        StructField("date", StringType, nullable = false),
-        StructField("device", deviceSchema, nullable = false),
-        StructField("fullVisitorId", LongType, nullable = false),
-        StructField("geoNetwork", geoNetworkSchema, nullable = false)
-      ))
-
       // Wczytanie danych z pliku CSV
       val csvFilePath = "/app/dane.csv"
-      val rawData = spark.read.option("header", true).option("quote", "\"").option("escape", "\"").csv(csvFilePath)
+      val rawData = spark.read
+        .option("header", value = true)
+        .option("quote", "\"")
+        .option("escape", "\"")
+        .csv(csvFilePath)
 
+      // Deserializacja kolumn JSON (device i geoNetwork) do struktur danych
       val processedData = rawData
         .withColumn("device", from_json(col("device"), deviceSchema))
         .withColumn("geoNetwork", from_json(col("geoNetwork"), geoNetworkSchema))
 
+      // Ekstrakcja kolumn zagnieżdżonych
       val explodedData = processedData.select(
         col("_c0"),
         col("date"),
         col("fullVisitorId"),
-        col("device.*"),        // Select all columns from the 'device' struct
-        col("geoNetwork.*")     // Select all columns from the 'geoNetwork' struct
+        col("device.*"),    // Wybór wszystkich kolumn ze struktury 'device'
+        col("geoNetwork.*") // Wybór wszystkich kolumn ze struktury 'geoNetwork'
       )
 
+      // Przygotowanie danych przed grupowaniem
       val preprocessedData = explodedData
         .withColumn("id_and_date", struct(col("fullVisitorId"), col("date")))
         .groupBy("country", "browser")
         .agg(collect_list("id_and_date").as("id_and_date_list"))
 
-      // 2. Sortowanie listy według daty
+      // Sortowanie listy według daty
       val sortedData = preprocessedData
         .withColumn("id_and_date_list", expr("sort_array(id_and_date_list, true)"))
 
-      // 3. Ograniczenie listy do maksymalnie 5 ostatnich odwiedzających
+      // Ograniczenie listy do maksymalnie 5 ostatnich odwiedzających
       val limitedData = sortedData
         .withColumn("id_and_date_list", expr("slice(id_and_date_list, 1, 5)"))
 
-      // 4. Przygotowanie struktury JSON
+      // Przygotowanie struktury JSON
       val resultData = limitedData
         .groupBy("country")
         .agg(collect_list(struct("browser", "id_and_date_list")).as("browser_data"))
 
-      // 5. Zapisanie wyniku do pliku JSON
-      resultData.write.json("/app/wyniki.json")
+      // Zapisanie wyniku do pliku JSON
+      resultData.coalesce(1).write.json("/app/wyniki.json")
 
       // Zakończenie sesji Spark
       spark.stop()
     } catch {
-      case e: Exception => e.printStackTrace()
+      // Obsługa błędów
+      case e: Exception =>
+        e.printStackTrace()
     }
   }
 }
