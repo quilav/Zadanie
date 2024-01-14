@@ -71,7 +71,7 @@ Krok ten można również wykonać inaczej, uruchamiając kontener i bezpośredn
 Wersja ta daje użytkownikowi nieco więcej zabawy.
 
    ```bash
-   docker run -it nazwa_obrazu
+   docker run -it nazwa_obrazu /bin/bash
    ```
 
 A następnie:
